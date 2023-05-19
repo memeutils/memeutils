@@ -1,0 +1,46 @@
+#!/bin/bash
+
+UriAndFile=()
+
+for File in "$@"; do
+	if [[ -e "$File" ]]; then
+		File="$(realpath -- "$File")"
+		Uri="$(perl -mURI::file -e 'print URI::file->new(@ARGV[0])' "$File")"
+		UriAndFile+=("$Uri" "$File")
+	elif [[ "$File" = "file://"* ]]; then
+		Uri="$File"
+		File="$(perl -mURI::file -e 'print URI::file->new(@ARGV[0])->file' "$File")"
+		UriAndFile+=("$Uri" "$File")
+	else
+		echo "Not a file: $File"
+	fi
+done
+
+printf '%s\0' "${UriAndFile[@]}" | while { read -r -d '' Uri; read -r -d '' File; }; do
+	Mime="$(file -bi -- "$File")"
+	if [[ "$Mime" != "video/"* ]] && [[ "$Mime" != "application/octet-stream;"* ]]; then
+		continue
+	fi
+
+	MpvName="$(ffprobe -v quiet -show_streams -print_format json -- "$File" | jq -r '[.streams[] | select(.codec_type == "video")][0] | {in:.,out:{}} | .out.w=.in.width | .out.h=.in.height | .out=(.in.display_aspect_ratio | split(":")? | map(tonumber) | {w:.[0],h:.[1]}) // . | .out.rotation=(.in.side_data_list | first | .rotation // 0) | if .out.rotation | fabs == 90 then .out.h - .out.w else .out.w - .out.h end > 0 | if . then "mpv-h" else "mpv-v" end')"
+	if [[ "$MpvName" = mpv-h ]]; then
+		Geometry=512x288
+	else
+		Geometry=288x512
+	fi
+	Sock="$XDG_RUNTIME_DIR/$MpvName.sock"
+	if ! [[ -S "$Sock" ]] || ! echo '{"command": ["client_name"]}' | nc -UN "$Sock" 2>/dev/null | grep -qF "success"; then
+		nohup firejail --restrict-namespaces --net=none --caps.drop=all \
+			env -i \
+			DISPLAY="$DISPLAY" \
+			XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+			XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+			mpv --idle --keep-open --player-operation-mode=pseudo-gui --input-ipc-server="$Sock" --loop-playlist=inf --auto-window-resize=no --geometry="$Geometry" &> /dev/null &
+		if ! Sock="$Sock" Command='{"command": ["client_name"]}' timeout 5 bash -c 'while ! echo "$Command" | nc -UN "$Sock" 2>/dev/null | grep -qF "success"; do sleep 0.1; done'; then
+			echo "Failed to start mpv"
+			exit 1
+		fi
+	fi
+	jq --null-input -r -c --arg File "$File" '{"command": ["loadfile", $File, "append-play"]}' | nc -UN "$Sock" &> /dev/null
+	echo "Opened: $File"
+done

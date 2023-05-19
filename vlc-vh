@@ -1,0 +1,116 @@
+#!/bin/bash
+
+UriAndFile=()
+
+for File in "$@"; do
+	if [[ -e "$File" ]]; then
+		File="$(realpath -- "$File")"
+		Uri="$(perl -mURI::file -e 'print URI::file->new(@ARGV[0])' "$File")"
+		UriAndFile+=("$Uri" "$File")
+	elif [[ "$File" = "file://"* ]]; then
+		Uri="$File"
+		File="$(perl -mURI::file -e 'print URI::file->new(@ARGV[0])->file' "$File")"
+		UriAndFile+=("$Uri" "$File")
+	else
+		echo "Not a file: $File"
+	fi
+done
+
+printf '%s\0' "${UriAndFile[@]}" | while { read -r -d '' Uri; read -r -d '' File; }; do
+	Mime="$(file -bi -- "$File")"
+	if [[ "$Mime" != "video/"* ]] && [[ "$Mime" != "application/octet-stream;"* ]]; then
+		continue
+	fi
+
+	VlcName="$(ffprobe -v quiet -show_streams -print_format json -- "$File" | jq -r '[.streams[] | select(.codec_type == "video")][0] | {in:.,out:{}} | .out.w=.in.width | .out.h=.in.height | .out=(.in.display_aspect_ratio | split(":")? | map(tonumber) | {w:.[0],h:.[1]}) // . | .out.rotation=(.in.side_data_list | first | .rotation // 0) | if .out.rotation | fabs == 90 then .out.h - .out.w else .out.w - .out.h end > 0 | if . then "vlc-h" else "vlc-v" end')"
+
+	VlcRuntimeDir="$XDG_RUNTIME_DIR/$VlcName"
+	DbusSock="$VlcRuntimeDir/$VlcName.sock"
+	OldrcSock="$VlcRuntimeDir/$VlcName.oldrc.sock"
+	mkdir -p -- "$VlcRuntimeDir/vlc"
+	XdgConfigDir="$HOME/.config"
+	if ! [[ -h "$VlcRuntimeDir/pulse" ]] && [[ -e "$XdgConfigDir/pulse" ]]; then
+		ln -s -- "$XdgConfigDir/pulse" "$VlcRuntimeDir/pulse"
+	fi
+	for VlcConf in "$XdgConfigDir/vlc/"*; do
+		# vlcrc, vlc-qt-interface.conf
+		if ! [[ -e "$VlcRuntimeDir/vlc/${VlcConf##*/}" ]]; then
+			cp -a -- "$VlcConf" "$VlcRuntimeDir/vlc/"
+		fi
+	done
+	if [[ -e "$VlcRuntimeDir/vlc/vlcrc" ]]; then
+		# WirePlumber volume changes in any instance affects all other instances when a video starts
+		# WirePlumber restores volume from "media.role"
+		# All VLC instances use an identical "media.role"
+		# So then unset "role" so that the "PULSE_PROP_media.role" environment variable is used below
+		# To look, cat ~/.local/state/wireplumber/restore-stream
+		sed -i -E '/^(# *)?role=/c\role=' -- "$VlcRuntimeDir/vlc/vlcrc"
+	fi
+
+	if ! [[ -S "$DbusSock" ]]; then
+		# D-Bus requires config file to be a regular file, not a pipe
+		DbusConfigFile="$(mktemp)"
+		trap 'rm -v -f -- "$DbusConfigFile"' EXIT
+		cat <<-EOF > "$DbusConfigFile"
+		<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+		"http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+		<busconfig>
+		<type>session</type>
+		<keep_umask/>
+		<listen>unix:path=$(printf %s "$DbusSock" | jq -Rr @html)</listen>
+		<auth>EXTERNAL</auth>
+		<policy context="default">
+			<!-- Allow everything to be sent -->
+			<allow send_destination="*" eavesdrop="true"/>
+			<!-- Allow everything to be received -->
+			<allow eavesdrop="true"/>
+			<!-- Allow anyone to own anything -->
+			<allow own="*"/>
+		</policy>
+		</busconfig>
+		EOF
+
+		nohup firejail \
+			--restrict-namespaces \
+			--net=none \
+			--dbus-system=none \
+			--dbus-user=none \
+			--whitelist="$XDG_RUNTIME_DIR/pulse" \
+			--whitelist="$VlcRuntimeDir" \
+			--read-write="$XDG_RUNTIME_DIR/pulse" \
+			--read-write="$VlcRuntimeDir" \
+			--read-only="$HOME" \
+			--caps.drop=all \
+			env -i \
+			DISPLAY="$DISPLAY" \
+			XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+			XDG_CONFIG_HOME="$VlcRuntimeDir" \
+			PULSE_PROP_application.id="org.VideoLAN.VLC.$VlcName" \
+			PULSE_PROP_application.name="$VlcName" \
+			PULSE_PROP_media.role="$VlcName" \
+			dbus-run-session \
+			--config-file "$DbusConfigFile" \
+			vlc \
+			--intf oldrc \
+			--rc-fake-tty \
+			--rc-unix "$OldrcSock" &> /dev/null & disown
+		# Ensure Qt GUI is open with oldrc to prevent video playing in a floating window
+		if ! OldrcSock="$OldrcSock" timeout 5 bash -c 'while ! [[ -S "$OldrcSock" ]] || ! printf "intf qt\nlogout\n" | nc -UN "$OldrcSock" | grep -qF "intf: returned 0"; do sleep 0.1; done'; then
+			echo 'Failed to start vlc'
+			rm -f -- "$DbusConfigFile"
+			exit 1
+		fi
+		rm -f -- "$DbusConfigFile"
+	fi
+	env -i dbus-send \
+		--bus=unix:path="$DbusSock" \
+		--type=method_call \
+		--print-reply \
+		--dest=org.mpris.MediaPlayer2.vlc \
+		/org/mpris/MediaPlayer2 \
+		org.mpris.MediaPlayer2.TrackList.AddTrack \
+		string:"$Uri" \
+		objpath:/ \
+		boolean:true &>/dev/null
+	echo "Opened $File"
+done
